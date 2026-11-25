@@ -1,0 +1,8 @@
+runpod>=1.7.0
+requests>=2.31.0
+soundfile>=0.12.1
+numpy<2.0
+demucs>=4.0.1
+openai-whisper>=20240930
+stable-ts>=2.17.3
+onnxruntime>=1.18.0
