@@ -125,72 +125,21 @@ def fmt_lrc_time(sec: float) -> str:
 
 
 TS_RE = re.compile(r"^\s*(?:\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]\s*)+")
+HALLUCINATION_RE = re.compile(
+    r"^(?:terima kasih(?: sudah menonton| telah menonton)?|thank you(?: for watching)?|thanks for watching|"
+    r"subscribe|like and subscribe|subtitles by|amara\.org|♪+|\.+|\s*)$",
+    re.IGNORECASE,
+)
 
 
-def handler(job):
-    t0 = time.time()
-    inp = job.get("input") or {}
-    audio_url = inp.get("audio_url")
-    raw_lines = inp.get("lines")
-    raw_text = inp.get("lyrics") or ""
-    req_lang = str(inp.get("language") or "").strip().lower()
+def extract_segments_from_result(result, duration_sec: float, fixed_lines=None):
+    raw_segs = list(result.segments) if result and getattr(result, "segments", None) else []
+    segments_out = []
+    lrc_lines = []
+    prev_start = 0.0
 
-    if not audio_url:
-        return {"error": "Missing audio_url"}
-
-    if isinstance(raw_lines, list) and len(raw_lines) > 0:
-        lines = [TS_RE.sub("", str(x)).strip() for x in raw_lines]
-    else:
-        lines = [TS_RE.sub("", l).strip() for l in str(raw_text).splitlines()]
-    lines = [l for l in lines if l and not (l.startswith("[") and l.endswith("]"))][:250]
-
-    if not lines:
-        return {"error": "No valid lyric lines provided"}
-
-    work_dir = tempfile.mkdtemp(prefix="scai_lyr_")
-    try:
-        # 1. Download audio from SC AI backend
-        in_path = os.path.join(work_dir, "input_audio")
-        r = requests.get(audio_url, stream=True, timeout=120)
-        if not r.ok:
-            return {"error": f"Failed to download input audio ({r.status_code})"}
-        with open(in_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-        # 2. Isolate clean singing vocals on GPU (HTDemucs)
-        t_sep = time.time()
-        voc_16k, duration_sec = isolate_vocals_16k(in_path, work_dir)
-        sep_sec = round(time.time() - t_sep, 2)
-
-        # 3. Forced-align lyrics to clean vocals using stable-ts (Whisper large-v3-turbo)
-        t_aln = time.time()
-        model = get_whisper()
-        lang = req_lang if req_lang and req_lang != "auto" else detect_vocal_language(model, voc_16k, fallback="id")
-
-        joined_lyrics = "\n".join(lines)
-        result = model.align(
-            voc_16k,
-            joined_lyrics,
-            language=lang,
-            original_split=True,
-            vad=True,
-            vad_threshold=0.32,
-            verbose=None,
-        )
-        aln_sec = round(time.time() - t_aln, 2)
-
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-
-        # 4. Build strictly-ordered line & word timestamps
-        raw_segs = list(result.segments) if result and getattr(result, "segments", None) else []
-        segments_out = []
-        lrc_lines = []
-
-        prev_start = 0.0
-        for idx, line_txt in enumerate(lines):
+    if fixed_lines is not None:
+        for idx, line_txt in enumerate(fixed_lines):
             seg = raw_segs[idx] if idx < len(raw_segs) else None
             if seg is not None:
                 s = float(getattr(seg, "start", prev_start) or prev_start)
@@ -224,9 +173,126 @@ def handler(job):
                 "words": words_out,
             })
             lrc_lines.append(f"{fmt_lrc_time(s)}{line_txt}")
+    else:
+        for seg in raw_segs:
+            txt = str(getattr(seg, "text", "") or "").strip()
+            txt = re.sub(r"\s+", " ", txt)
+            if not txt or HALLUCINATION_RE.match(txt):
+                continue
+            s = float(getattr(seg, "start", prev_start) or prev_start)
+            e = float(getattr(seg, "end", s + 2.0) or (s + 2.0))
+            if segments_out and s < prev_start + 0.12:
+                s = min(duration_sec - 0.2, prev_start + 0.12)
+            e = max(s + 0.35, min(duration_sec, e))
+            prev_start = s
+
+            words_out = []
+            for w in (getattr(seg, "words", None) or []):
+                wt = str(getattr(w, "word", "") or "").strip()
+                if not wt:
+                    continue
+                ws = float(getattr(w, "start", s) or s)
+                we = float(getattr(w, "end", ws + 0.2) or (ws + 0.2))
+                words_out.append({
+                    "start": round(max(0.0, ws), 3),
+                    "end": round(max(ws + 0.05, we), 3),
+                    "word": wt,
+                })
+
+            segments_out.append({
+                "start": round(s, 3),
+                "end": round(e, 3),
+                "text": txt,
+                "words": words_out,
+            })
+            lrc_lines.append(f"{fmt_lrc_time(s)}{txt}")
+
+    return segments_out, lrc_lines
+
+
+def handler(job):
+    t0 = time.time()
+    inp = job.get("input") or {}
+    audio_url = inp.get("audio_url")
+    raw_lines = inp.get("lines")
+    raw_text = inp.get("lyrics") or ""
+    req_lang = str(inp.get("language") or "").strip().lower()
+    mode = str(inp.get("mode") or "").strip().lower()
+
+    if not audio_url:
+        return {"error": "Missing audio_url"}
+
+    if isinstance(raw_lines, list) and len(raw_lines) > 0:
+        lines = [TS_RE.sub("", str(x)).strip() for x in raw_lines]
+    else:
+        lines = [TS_RE.sub("", l).strip() for l in str(raw_text).splitlines()]
+    lines = [l for l in lines if l and not (l.startswith("[") and l.endswith("]"))][:250]
+
+    if mode not in ("transcribe", "align"):
+        mode = "align" if lines else "transcribe"
+
+    if mode == "align" and not lines:
+        return {"error": "No valid lyric lines provided for align mode"}
+
+    work_dir = tempfile.mkdtemp(prefix="scai_lyr_")
+    try:
+        # 1. Download audio from SC AI backend
+        in_path = os.path.join(work_dir, "input_audio")
+        r = requests.get(audio_url, stream=True, timeout=120)
+        if not r.ok:
+            return {"error": f"Failed to download input audio ({r.status_code})"}
+        with open(in_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        # 2. Isolate clean singing vocals on GPU (HTDemucs)
+        t_sep = time.time()
+        voc_16k, duration_sec = isolate_vocals_16k(in_path, work_dir)
+        sep_sec = round(time.time() - t_sep, 2)
+
+        # 3. Transcribe OR Forced-align on clean vocals (stable-ts + Whisper large-v3-turbo)
+        t_aln = time.time()
+        model = get_whisper()
+        lang = req_lang if req_lang and req_lang != "auto" else detect_vocal_language(model, voc_16k, fallback="id")
+
+        if mode == "transcribe":
+            result = model.transcribe(
+                voc_16k,
+                language=lang,
+                vad=True,
+                vad_threshold=0.32,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                regroup=True,
+                verbose=None,
+            )
+            try:
+                result.split_by_length(max_chars=48)
+            except Exception:
+                pass
+            segments_out, lrc_lines = extract_segments_from_result(result, duration_sec, fixed_lines=None)
+        else:
+            joined_lyrics = "\n".join(lines)
+            result = model.align(
+                voc_16k,
+                joined_lyrics,
+                language=lang,
+                original_split=True,
+                vad=True,
+                vad_threshold=0.32,
+                verbose=None,
+            )
+            segments_out, lrc_lines = extract_segments_from_result(result, duration_sec, fixed_lines=lines)
+
+        aln_sec = round(time.time() - t_aln, 2)
+
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
 
         return {
             "status": "ok",
+            "mode": mode,
             "model": f"HTDemucs + Whisper {WHISPER_MODEL_NAME}",
             "language": lang,
             "durationSec": round(duration_sec, 2),
