@@ -14,3 +14,4 @@ Dedicated GPU worker for high-accuracy singing lyrics forced alignment (**HTDemu
    - **Execution Timeout**: `180` detik.
    - **Container Disk**: `15 GB`.
 3. Setelah status endpoint **Ready**, salin **Endpoint ID** lalu tempel di **SC AI Admin Panel → Pengaturan API → GPU Auto-Sync Lirik (RunPod Serverless)**.
+
